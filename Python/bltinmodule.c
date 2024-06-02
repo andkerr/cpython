@@ -1303,6 +1303,7 @@ typedef struct {
     PyObject_HEAD
     PyObject *iters;
     PyObject *func;
+    int strict;
 } mapobject;
 
 static PyObject *
@@ -1311,10 +1312,22 @@ map_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     PyObject *it, *iters, *func;
     mapobject *lz;
     Py_ssize_t numargs, i;
+    int strict = 0;
 
-    if ((type == &PyMap_Type || type->tp_init == PyMap_Type.tp_init) &&
-        !_PyArg_NoKeywords("map", kwds))
-        return NULL;
+    if (kwds) {
+        printf("%s\n", "map_new -> we've got kwargs...");
+        PyObject *empty = PyTuple_New(0);
+        if (empty == NULL) {
+            return NULL;
+        }
+        static char *kwlist[] = {"strict", NULL};
+        int parsed = PyArg_ParseTupleAndKeywords(
+                empty, kwds, "|$p:map", kwlist, &strict);
+        Py_DECREF(empty);
+        if (!parsed) {
+            return NULL;
+        }
+    }
 
     numargs = PyTuple_Size(args);
     if (numargs < 2) {
@@ -1346,6 +1359,7 @@ map_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     lz->iters = iters;
     func = PyTuple_GET_ITEM(args, 0);
     lz->func = Py_NewRef(func);
+    lz->strict = strict;
 
     return (PyObject *)lz;
 }
@@ -1355,11 +1369,8 @@ map_vectorcall(PyObject *type, PyObject * const*args,
                 size_t nargsf, PyObject *kwnames)
 {
     PyTypeObject *tp = _PyType_CAST(type);
-    if (tp == &PyMap_Type && !_PyArg_NoKwnames("map", kwnames)) {
-        return NULL;
-    }
-
     Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    int strict = 0;
     if (nargs < 2) {
         PyErr_SetString(PyExc_TypeError,
            "map() must have at least two arguments.");
@@ -1380,6 +1391,13 @@ map_vectorcall(PyObject *type, PyObject * const*args,
         PyTuple_SET_ITEM(iters, i-1, it);
     }
 
+    if (kwnames != NULL) {
+        if (PyTuple_GET_SIZE(kwnames) != 1) {
+            return NULL;
+        }
+        strict = PyObject_IsTrue(args[nargs]);
+    }
+
     mapobject *lz = (mapobject *)tp->tp_alloc(tp, 0);
     if (lz == NULL) {
         Py_DECREF(iters);
@@ -1387,6 +1405,7 @@ map_vectorcall(PyObject *type, PyObject * const*args,
     }
     lz->iters = iters;
     lz->func = Py_NewRef(args[0]);
+    lz->strict = strict;
 
     return (PyObject *)lz;
 }
@@ -1411,6 +1430,7 @@ map_traverse(mapobject *lz, visitproc visit, void *arg)
 static PyObject *
 map_next(mapobject *lz)
 {
+    Py_ssize_t i;
     PyObject *small_stack[_PY_FASTCALL_SMALL_STACK];
     PyObject **stack;
     PyObject *result = NULL;
@@ -1429,7 +1449,7 @@ map_next(mapobject *lz)
     }
 
     Py_ssize_t nargs = 0;
-    for (Py_ssize_t i=0; i < niters; i++) {
+    for (i=0; i < niters; i++) {
         PyObject *it = PyTuple_GET_ITEM(lz->iters, i);
         PyObject *val = Py_TYPE(it)->tp_iternext(it);
         if (val == NULL) {
@@ -1448,7 +1468,45 @@ exit:
     if (stack != small_stack) {
         PyMem_Free(stack);
     }
-    return result;
+
+    if (!lz->strict) {
+        return result;
+    }
+
+    if (PyErr_Occurred()) {
+        if (!PyErr_ExceptionMatches(PyExc_StopIteration)) {
+            // next() on argument i raised an exception (not StopIteration)
+            return NULL;
+        }
+        PyErr_Clear();
+    }
+    if (i) {
+        // ValueError: map() argument 2 is shorter than argument 1
+        // ValueError: map() argument 3 is shorter than arguments 1-2
+        const char* plural = i == 1 ? " " : "s 2-";
+        return PyErr_Format(PyExc_ValueError,
+                            "map() argument %d is shorter than argument%s%d",
+                            i + 1, plural, i);
+    }
+    for (i = 1; i < niters; i++) {
+        PyObject *it = PyTuple_GET_ITEM(lz->iters, i);
+        PyObject *val = Py_TYPE(it)->tp_iternext(it);
+        if (val) {
+            Py_DECREF(val);
+            const char* plural = i == 1 ? " " : "s 2-";
+            return PyErr_Format(PyExc_ValueError,
+                                "map() argument %d is longer than argument%s%d",
+                                i + 1, plural, i);
+        }
+        if (PyErr_Occurred()) {
+            if (!PyErr_ExceptionMatches(PyExc_StopIteration)) {
+                // next() on argument i raised an exception (not StopIteration)
+                return NULL;
+            }
+            PyErr_Clear();
+        }
+    }
+    return NULL;
 }
 
 static PyObject *
@@ -1465,21 +1523,41 @@ map_reduce(mapobject *lz, PyObject *Py_UNUSED(ignored))
         PyTuple_SET_ITEM(args, i+1, Py_NewRef(it));
     }
 
-    return Py_BuildValue("ON", Py_TYPE(lz), args);
+    if (lz->strict) {
+        return PyTuple_Pack(3, Py_TYPE(lz), args, Py_True);
+    }
+    return PyTuple_Pack(2, Py_TYPE(lz), args);
 }
+
+static PyObject *
+map_setstate(mapobject *lz, PyObject *state)
+{
+    int strict = PyObject_IsTrue(state);
+    if (strict < 0) {
+        return NULL;
+    }
+    lz->strict = strict;
+    Py_RETURN_NONE;
+}
+
+PyDoc_STRVAR(setstate_doc, "Set state information for unpickling.");
 
 static PyMethodDef map_methods[] = {
     {"__reduce__", _PyCFunction_CAST(map_reduce), METH_NOARGS, reduce_doc},
+    {"__setstate__", _PyCFunction_CAST(map_setstate), METH_O, setstate_doc},
     {NULL,           NULL}           /* sentinel */
 };
 
 
 PyDoc_STRVAR(map_doc,
-"map(function, /, *iterables)\n\
+"map(function, /, *iterables, strict=False)\n\
 --\n\
 \n\
 Make an iterator that computes the function using arguments from\n\
-each of the iterables.  Stops when the shortest iterable is exhausted.");
+each of the iterables.  Stops when the shortest iterable is exhausted.\n\
+\n\
+If strict is true and one of the arguments is exhausted before the others,\n\
+raise a ValueError.");
 
 PyTypeObject PyMap_Type = {
     PyVarObject_HEAD_INIT(&PyType_Type, 0)
@@ -2973,8 +3051,6 @@ zip_reduce(zipobject *lz, PyObject *Py_UNUSED(ignored))
     }
     return PyTuple_Pack(2, Py_TYPE(lz), lz->ittuple);
 }
-
-PyDoc_STRVAR(setstate_doc, "Set state information for unpickling.");
 
 static PyObject *
 zip_setstate(zipobject *lz, PyObject *state)
